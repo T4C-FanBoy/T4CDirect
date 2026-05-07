@@ -43,7 +43,7 @@ Requires PowerShell 5.1+ (default on Windows 10/11).
 ```powershell
 git clone https://github.com/T4C-FanBoy/T4CDirect.git
 cd T4CDirect
-powershell -ExecutionPolicy Bypass -File .\t4c-direct.ps1
+Manually open T4C Direct.vbs
 ```
 
 ### Usage
@@ -148,7 +148,7 @@ Nécessite PowerShell 5.1+ (présent par défaut sur Windows 10/11).
 ```powershell
 git clone https://github.com/T4C-FanBoy/T4CDirect.git
 cd T4CDirect
-powershell -ExecutionPolicy Bypass -File .\t4c-direct.ps1
+Ouvrez manuellement T4C Direct.vbs
 ```
 
 ### Utilisation
