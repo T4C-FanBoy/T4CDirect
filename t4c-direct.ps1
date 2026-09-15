@@ -92,39 +92,72 @@ $clientPath = Join-Path $installDir 'T4C Client.bin'
 $workingDir = $installDir
 $iconPath   = Join-Path $installDir 't4c.ico'
 
+# --- Watchdog patch -------------------------------------------------------
+# The tamper check compiles to:  call <check>; test al,al; je +0x1ED
+# We locate that jump by a UNIQUE byte signature instead of a fixed file
+# offset, so the patch keeps working when a client update shifts the code
+# (older builds had it at 0x147AF0; newer ones moved it elsewhere).
+$wdAnchor = [byte[]](0x84,0xC0)                       # test al,al  (disambiguator)
+$wdOrig   = [byte[]](0x0f,0x84,0xed,0x01,0x00,0x00)   # je 0x1ED    (6 bytes we NOP out)
+$wdPatch  = [byte[]](0x90,0x90,0x90,0x90,0x90,0x90)   # 6x NOP
+
+function Find-ByteSig {
+    # Fast scan: returns @{ Index = <first match, or -1>; Count = <total matches> }
+    param([byte[]]$Hay, [byte[]]$Needle)
+    if (-not $Hay -or -not $Needle -or $Needle.Length -eq 0) { return @{ Index = -1; Count = 0 } }
+    $first = $Needle[0]; $nlen = $Needle.Length
+    $max = $Hay.Length - $nlen
+    $i = 0; $found = -1; $count = 0
+    while ($i -le $max) {
+        $i = [Array]::IndexOf($Hay, $first, $i)
+        if ($i -lt 0 -or $i -gt $max) { break }
+        $ok = $true
+        for ($k = 1; $k -lt $nlen; $k++) {
+            if ($Hay[$i + $k] -ne $Needle[$k]) { $ok = $false; break }
+        }
+        if ($ok) { if ($found -lt 0) { $found = $i }; $count++ }
+        $i++
+    }
+    return @{ Index = $found; Count = $count }
+}
+
 function Apply-WatchdogPatch {
     param([string]$Path)
-    $patchOffset = 0x147AF0
-    $expected = [byte[]](0x0f,0x84,0xed,0x01,0x00,0x00)
-    $patched  = [byte[]](0x90,0x90,0x90,0x90,0x90,0x90)
 
     if (-not (Test-Path $Path)) { return @{ Status='NotFound'; Message='client missing' } }
 
     try { $bytes = [IO.File]::ReadAllBytes($Path) }
     catch { return @{ Status='Error'; Message=("read failed: " + $_.Exception.Message) } }
 
-    if ($bytes.Length -lt ($patchOffset + 6)) {
-        return @{ Status='Unknown'; Message='file too small' }
-    }
-    $current = $bytes[$patchOffset..($patchOffset + 5)]
-    if (-not (Compare-Object $current $patched -SyncWindow 0)) {
+    $sigOrig  = $wdAnchor + $wdOrig
+    $sigPatch = $wdAnchor + $wdPatch
+
+    # Already patched? (signature carries the NOPs)
+    if ((Find-ByteSig -Hay $bytes -Needle $sigPatch).Index -ge 0) {
         return @{ Status='AlreadyPatched'; Message='watchdog already patched' }
     }
-    if (Compare-Object $current $expected -SyncWindow 0) {
-        $hex = ($current | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
-        return @{ Status='Unknown'; Message=("unexpected bytes [$hex] - patch skipped") }
+
+    # Locate the un-patched watchdog jump by signature
+    $o = Find-ByteSig -Hay $bytes -Needle $sigOrig
+    if ($o.Index -lt 0) {
+        return @{ Status='Unknown'; Message='watchdog signature not found - patch skipped' }
     }
+    if ($o.Count -gt 1) {
+        return @{ Status='Unknown'; Message=("watchdog signature ambiguous ({0} matches) - patch skipped" -f $o.Count) }
+    }
+
+    $jeOffset = $o.Index + $wdAnchor.Length
 
     $bak = "$Path.bak"
     try {
         if (-not (Test-Path $bak)) { Copy-Item -Path $Path -Destination $bak -Force }
     } catch { return @{ Status='Error'; Message=("backup failed: " + $_.Exception.Message) } }
 
-    for ($i = 0; $i -lt 6; $i++) { $bytes[$patchOffset + $i] = $patched[$i] }
+    for ($i = 0; $i -lt $wdPatch.Length; $i++) { $bytes[$jeOffset + $i] = $wdPatch[$i] }
     try { [IO.File]::WriteAllBytes($Path, $bytes) }
     catch { return @{ Status='Error'; Message=("write failed: " + $_.Exception.Message) } }
 
-    return @{ Status='Patched'; Message='watchdog patched - backup at .bak' }
+    return @{ Status='Patched'; Message=('watchdog patched @ 0x{0:X} - backup at .bak' -f $jeOffset) }
 }
 
 $patchResult = Apply-WatchdogPatch -Path $clientPath
@@ -132,9 +165,7 @@ $patchResult = Apply-WatchdogPatch -Path $clientPath
 $webPatchBase = 'https://t4c-world.com/patch/__t4c_update_184__/'
 $skipUpdatePaths = @('T4C Client_64.bin')   # no watchdog analysis for 64-bit yet
 $clientBinaries  = @('T4C Client.bin')      # handled with special rename/download/patch/revert flow
-$watchdogOffset  = 0x147AF0
-$watchdogExpect  = [byte[]](0x0f,0x84,0xed,0x01,0x00,0x00)
-$watchdogPatch   = [byte[]](0x90,0x90,0x90,0x90,0x90,0x90)
+# Watchdog signature bytes ($wdAnchor/$wdOrig/$wdPatch) are defined above with Apply-WatchdogPatch.
 
 function Get-RemoteUrl([string]$Base, [string]$RelPath) {
     $segments = $RelPath -split '\\' | ForEach-Object { [Uri]::EscapeDataString($_) }
@@ -1524,6 +1555,26 @@ $updateScript = {
         } catch {}
     }
 
+    function Find-ByteSig {
+        # Fast scan: returns @{ Index = <first match, or -1>; Count = <total matches> }
+        param([byte[]]$Hay, [byte[]]$Needle)
+        if (-not $Hay -or -not $Needle -or $Needle.Length -eq 0) { return @{ Index = -1; Count = 0 } }
+        $first = $Needle[0]; $nlen = $Needle.Length
+        $max = $Hay.Length - $nlen
+        $i = 0; $found = -1; $count = 0
+        while ($i -le $max) {
+            $i = [Array]::IndexOf($Hay, $first, $i)
+            if ($i -lt 0 -or $i -gt $max) { break }
+            $ok = $true
+            for ($k = 1; $k -lt $nlen; $k++) {
+                if ($Hay[$i + $k] -ne $Needle[$k]) { $ok = $false; break }
+            }
+            if ($ok) { if ($found -lt 0) { $found = $i }; $count++ }
+            $i++
+        }
+        return @{ Index = $found; Count = $count }
+    }
+
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     # Fetch server list (best-effort, doesn't block update flow on failure)
@@ -1600,11 +1651,12 @@ $updateScript = {
     function Test-PatchedMatchesManifest([string]$Path, [string]$ExpectedMd5) {
         try {
             $b = [IO.File]::ReadAllBytes($Path)
-            if ($b.Length -lt ($PatchOffset + 6)) { return $false }
-            for ($i = 0; $i -lt 6; $i++) {
-                if ($b[$PatchOffset + $i] -ne $PatchBytes[$i]) { return $false }
-            }
-            for ($i = 0; $i -lt 6; $i++) { $b[$PatchOffset + $i] = $PatchExpect[$i] }
+            # Find our patched watchdog (test al,al + 6x NOP); if present, undo it in
+            # memory and check whether the result hashes to the manifest version.
+            $m = Find-ByteSig -Hay $b -Needle ($WdAnchor + $WdPatch)
+            if ($m.Index -lt 0) { return $false }
+            $je = $m.Index + $WdAnchor.Length
+            for ($i = 0; $i -lt $WdOrig.Length; $i++) { $b[$je + $i] = $WdOrig[$i] }
             $md = [Security.Cryptography.MD5]::Create()
             $h = -join ($md.ComputeHash($b) | ForEach-Object { '{0:X2}' -f $_ })
             $md.Dispose()
@@ -1739,17 +1791,17 @@ $updateScript = {
             continue
         }
 
-        # Patch the new binary
+        # Patch the new binary -- locate the watchdog jump by signature, not a fixed offset
         $patched = $false
         try {
             $bytes = [IO.File]::ReadAllBytes($localFile)
-            if ($bytes.Length -ge ($PatchOffset + 6)) {
-                $matches = $true
-                for ($i = 0; $i -lt 6; $i++) {
-                    if ($bytes[$PatchOffset + $i] -ne $PatchExpect[$i]) { $matches = $false; break }
-                }
-                if ($matches) {
-                    for ($i = 0; $i -lt 6; $i++) { $bytes[$PatchOffset + $i] = $PatchBytes[$i] }
+            if ((Find-ByteSig -Hay $bytes -Needle ($WdAnchor + $WdPatch)).Index -ge 0) {
+                $patched = $true                       # binary already carries the NOPs
+            } else {
+                $o = Find-ByteSig -Hay $bytes -Needle ($WdAnchor + $WdOrig)
+                if ($o.Index -ge 0 -and $o.Count -eq 1) {
+                    $je = $o.Index + $WdAnchor.Length
+                    for ($i = 0; $i -lt $WdPatch.Length; $i++) { $bytes[$je + $i] = $WdPatch[$i] }
                     [IO.File]::WriteAllBytes($localFile, $bytes)
                     $patched = $true
                 }
@@ -1822,9 +1874,9 @@ function Start-UpdateRunspace {
     $rs.SessionStateProxy.SetVariable('BaseUrl',        $webPatchBase)
     $rs.SessionStateProxy.SetVariable('SkipPaths',      $skipUpdatePaths)
     $rs.SessionStateProxy.SetVariable('ClientBinaries', $clientBinaries)
-    $rs.SessionStateProxy.SetVariable('PatchOffset',    $watchdogOffset)
-    $rs.SessionStateProxy.SetVariable('PatchExpect',    $watchdogExpect)
-    $rs.SessionStateProxy.SetVariable('PatchBytes',     $watchdogPatch)
+    $rs.SessionStateProxy.SetVariable('WdAnchor',       $wdAnchor)
+    $rs.SessionStateProxy.SetVariable('WdOrig',         $wdOrig)
+    $rs.SessionStateProxy.SetVariable('WdPatch',        $wdPatch)
     $rs.SessionStateProxy.SetVariable('ServerListUrl',  $serverListUrl)
     $rs.SessionStateProxy.SetVariable('Shared',         $shared)
 
